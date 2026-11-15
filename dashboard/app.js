@@ -1,4 +1,4 @@
-// Token Radar v1 — the dashboard. It reads window.RADAR (written beside dashboard/ by main.ts)
+// Token Radar v2 — the dashboard. It reads window.RADAR (written beside dashboard/ by main.ts)
 // and renders the ranked board, the filters, the per-protocol detail panel and the live-token
 // section. No network: every byte it shows is in data.js, and every farm plan it shows is the
 // board's own plan, string for string.
@@ -29,21 +29,24 @@
     if (days >= 365) return (days / 365).toFixed(1) + 'y';
     return Math.max(0, Math.round(days)) + 'd';
   }
-  function fmtMult(n) {
-    return (n === null || n === undefined || !isFinite(n)) ? 'n/a' : 'x' + n.toFixed(2);
+  function fmtSigned(n) {
+    return (n === null || n === undefined || !isFinite(n)) ? 'n/a' : (n > 0 ? '+' : '') + n.toFixed(2);
   }
 
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same
-  // arithmetic. Category multiple comes from the row itself — the same table main.ts uses.
+  // arithmetic. radar-3 is a fitted log-linear model: log(implied) = intercept + slope*ln(TVL) +
+  // agePerYear*ageYrs + categoryEffect[cat], with ageYrs from the row's age in days (or the
+  // fitted median age when the listing date is unknown) and growth weight 0. The coefficients
+  // come from DATA.model, which main.ts fitted on the snapshot's traded protocols.
   function impliedOf(row) {
     var m = DATA.model;
-    var growth = Math.min(m.growth_cap, Math.max(m.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = 1 + (growth / 100) * m.growth_weight;
-    var ageMult = row.age_days === null || row.age_days === undefined
-      ? m.unknown_age_multiplier
-      : m.age_floor + (Math.min(Math.max(row.age_days, 0), m.age_cap_days) / m.age_cap_days) * m.age_range;
-    return Math.max(1, Math.round(row.tvl_usd * row.category_multiple * growthMult * ageMult));
+    var ageYrs = row.age_days === null || row.age_days === undefined
+      ? m.median_age_days / 365
+      : row.age_days / 365;
+    var effect = m.category_effects[row.category || ''] || 0;
+    var fittedLog = m.intercept + m.slope_log_tvl * Math.log(row.tvl_usd) + m.age_per_year * ageYrs + effect;
+    return Math.max(1, Math.round(Math.exp(fittedLog)));
   }
 
   function el(tag, attrs) {
@@ -246,13 +249,16 @@
 
   function modelPanel() {
     var m = DATA.model;
+    var effects = Object.keys(m.category_effects).sort().map(function (c) {
+      return c + ' ' + fmtSigned(m.category_effects[c]);
+    }).join(', ');
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'note', text: 'One function scores every protocol, from the snapshot figures alone. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x categoryMultiple x (1 + ' + m.growth_weight + ' x clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100) x ageMult )'
+        'log(implied) = ' + m.intercept.toFixed(3) + ' + ' + m.slope_log_tvl.toFixed(3) + ' x ln(tvl_usd) + ' + m.age_per_year.toFixed(3) + ' x ageYrs + categoryEffect'
       ),
-      el('p', { class: 'note', text: 'categoryMultiple is measured, not asserted: for each category, the median market-cap/TVL of the snapshot\'s own token-trading protocols (mcap_usd > 0, tvl_usd > 0; n = 128; overall median 0.21). Small samples (n < 3) are shrunk toward the overall median, categories with no traded protocol take the overall median, and every multiple is clamped to 0.08–0.45 — so Dexs 0.34 and RWA 0.27 lead, while Lending 0.13 and CDP 0.17 sit near the bottom. Bridge-family medians cannot leak in: Bridge, Canonical Bridge, Cross Chain Bridge and Liquid Staking are excluded from the board, so no bridge-family row is ranked at all. Growth is clamped hard because the snapshot\'s 7-day changes run to +4,448%. ageMult runs 0.75 to 1.20 over the first ' + m.age_cap_days + ' days with no token — a longer no-token history is a longer track record of value kept off-market — and 0.95 when the listing date is unknown. The early radar is the strongest pre-token protocols outside the watchlist, by model score; live-token protocols are set aside below with their market caps.' })
+      el('p', { class: 'note', text: 'This is a fitted model, not an asserted table: ordinary least squares on the snapshot\'s own ' + m.n_comps + ' token-trading protocols (mcap_usd > 0, tvl_usd > 0) gives intercept ' + m.intercept.toFixed(3) + ', a log-TVL slope of ' + m.slope_log_tvl.toFixed(3) + ' — value scales sublinearly, 100x TVL is worth about 8x market cap — and +' + m.age_per_year.toFixed(3) + ' per year with no token. R^2 is ' + m.r_squared.toFixed(2) + ' and the 5-fold cross-validated median error is ' + Math.round(m.cv_median_error_pct) + '%: the traded comps themselves scatter about 90% around any TVL model, so the board ranks by the fitted central value, not a price. Category effects exist only for categories with at least 3 traded comps, are shrunk x n/(n+3) and capped at |effect| <= ln(3); every other category takes 0 (pooled): ' + effects + '. A missing listing date is scored at the snapshot\'s median age of ' + m.median_age_days + ' days. Growth gets weight 0: the fitted growth coefficient is negative and adds under 0.02 to R^2, so a one-week pump is mean-reversion, not value — the 7-day change is still shown on every row. Bridge-family rows cannot leak in: Bridge, Canonical Bridge, Cross Chain Bridge and Liquid Staking are excluded from the board, so no bridge-family row is ranked at all. The early radar is the strongest pre-token protocols outside the watchlist, by model score; live-token protocols are set aside below with their market caps.' })
     );
   }
 
@@ -300,6 +306,10 @@
     writeHash();
     detail.textContent = '';
     var recomputed = impliedOf(row);
+    var m = DATA.model;
+    var ageYrs = row.age_days === null || row.age_days === undefined ? m.median_age_days / 365 : row.age_days / 365;
+    var effect = m.category_effects[row.category || ''] || 0;
+    var fittedLog = m.intercept + m.slope_log_tvl * Math.log(row.tvl_usd) + m.age_per_year * ageYrs + effect;
     var steps = row.farm_steps || [];
     detail.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
@@ -313,11 +323,12 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: fmtMult(row.category_multiple) })),
-        el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: fmtMult(row.growth_multiplier) })),
-        el('div', null, el('span', { text: 'Age multiplier' }), el('b', { class: 'num', text: fmtMult(row.age_multiplier) })),
+        el('div', null, el('span', { text: 'Intercept' }), el('b', { class: 'num', text: m.intercept.toFixed(3) })),
+        el('div', null, el('span', { text: 'Slope x ln(TVL)' }), el('b', { class: 'num', text: (m.slope_log_tvl * Math.log(row.tvl_usd)).toFixed(2) })),
+        el('div', null, el('span', { text: 'Age term (' + ageYrs.toFixed(2) + 'y)' }), el('b', { class: 'num', text: (m.age_per_year * ageYrs).toFixed(2) })),
+        el('div', null, el('span', { text: 'Category effect' }), el('b', { class: 'num', text: fmtSigned(effect) })),
+        el('div', null, el('span', { text: 'Seven-day growth (weight 0)' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
+        el('div', null, el('span', { text: 'Fitted log value' }), el('b', { class: 'num', text: fittedLog.toFixed(2) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price, and it says nothing about whether or when a token is issued.' })
